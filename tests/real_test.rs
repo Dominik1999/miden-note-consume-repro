@@ -260,6 +260,9 @@ async fn real_consume_secret_hash_note() -> anyhow::Result<()> {
     }
 
     // ── 8. Try to consume the custom note — THIS SHOULD FAIL ──
+    eprintln!("step 8: syncing before consume attempt...");
+    client.sync_state().await?;
+
     eprintln!("step 8: attempting to consume custom note with secret as note_args...");
     eprintln!("        (this is where StackReadFailed occurs with real client)");
 
