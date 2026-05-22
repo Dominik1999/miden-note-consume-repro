@@ -1,0 +1,16 @@
+[package]
+name = "miden-note-consume-repro"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+miden-client = { version = "0.14", features = ["testing", "tonic"] }
+miden-client-sqlite-store = "0.14"
+miden-protocol = "0.14"
+miden-testing = "0.14"
+miden-standards = "0.14"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+rand = "0.9"
+rand_chacha = "0.9"
+anyhow = "1"
+tempfile = "3"
