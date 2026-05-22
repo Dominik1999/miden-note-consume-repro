@@ -60,10 +60,24 @@ This is the pattern from the Miden docs custom note tutorial.
 
 ## Environment
 
-- miden-client: 0.14.5
+- miden-client: 0.14.9
+- miden-client-sqlite-store: 0.14.9
 - miden-protocol: 0.14.5
-- miden-testing: 0.14.5
+- miden-testing: 0.14.6
+- miden-standards: 0.14.5
 - Testnet: https://rpc.testnet.miden.io
+
+### Known Issues
+
+**Bug 1 (miden-client 0.14.5): StackReadFailed on custom note consumption**
+Custom note scripts that use `active_note::get_storage` work in MockChain but
+fail with `StackReadFailed` when consumed via the real miden-client.
+
+**Bug 2 (miden-client 0.14.9): MMR sync panic**
+`sync_state()` panics with `MMR peaks stored for a block header must use that
+block number as the forest` during the sync poll loop. This prevents the real
+test from reaching the note consumption step. This may be a regression in
+0.14.9 — sync works fine in 0.14.5.
 
 ## Expected Behavior
 
