@@ -56,8 +56,6 @@ async fn mock_consume_secret_hash_note() -> anyhow::Result<()> {
     builder.add_output_note(RawOutputNote::Full(note));
     let mut mock_chain = builder.build()?;
 
-    // Need two blocks for the note to become consumable
-    mock_chain.prove_next_block()?;
     mock_chain.prove_next_block()?;
 
     // 4. Consume the note by passing the secret as note_args
@@ -111,7 +109,6 @@ async fn mock_wrong_secret_rejected() -> anyhow::Result<()> {
 
     builder.add_output_note(RawOutputNote::Full(note));
     let mut mock_chain = builder.build()?;
-    mock_chain.prove_next_block()?;
     mock_chain.prove_next_block()?;
 
     // Pass wrong secret
