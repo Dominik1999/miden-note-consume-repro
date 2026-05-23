@@ -214,7 +214,7 @@ async fn real_consume_secret_hash_note() -> anyhow::Result<()> {
     .into();
 
     let metadata =
-        NoteMetadata::new(consumer_id, NoteType::Public).with_tag(NoteTag::new(0));
+        NoteMetadata::new(consumer_id, NoteType::Public).with_tag(NoteTag::with_account_target(consumer_id));
     let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
     let recipient = NoteRecipient::new(serial_num, note_script, storage);
     let note = Note::new(vault, metadata, recipient);
