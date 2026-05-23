@@ -891,3 +891,224 @@ async fn real_adn_note() -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Simulates the facilitator pattern: note created by client A, serialized
+/// to bytes, then deserialized and consumed by a SEPARATE client B.
+///
+/// This matches the real-world flow:
+///   - setup-testnet creates the note and saves it as adn_note.b64
+///   - facilitator deserializes it from bytes and consumes via a different client
+///
+/// If real_adn_note passes (same client) but THIS fails, the issue is in
+/// the cross-client serialization/deserialization or client state setup.
+#[tokio::test]
+#[ignore = "requires network access to Miden testnet"]
+async fn real_adn_cross_client() -> anyhow::Result<()> {
+    use miden_protocol::utils::serde::{Deserializable, Serializable};
+    use miden_protocol::vm::AdviceInputs;
+
+    // ═══════════════════════════════════════════════════════════════
+    // CLIENT A: creates accounts + note (simulates setup-testnet)
+    // ═══════════════════════════════════════════════════════════════
+    let tmp_a = tempfile::tempdir()?;
+    let (mut client_a, keystore_a) = build_client(tmp_a.path()).await?;
+    client_a.sync_state().await?;
+    eprintln!("[cross] step 0: client A synced");
+
+    // Deploy faucet
+    let faucet_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client_a.rng());
+    let symbol = TokenSymbol::new("XCTEST").map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let faucet = AccountBuilder::new(rand_seed(&mut client_a))
+        .account_type(AccountType::FungibleFaucet)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            faucet_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicFungibleFaucet::new(symbol, 6, Felt::new(1_000_000_000)).map_err(|e| anyhow::anyhow!("{e:?}"))?)
+        .with_component(AuthControlled::allow_all())
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client_a.add_account(&faucet, false).await?;
+    keystore_a.add_key(&faucet_key, faucet.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let faucet_id = faucet.id();
+
+    // Deploy the "agent" account (note creator) — this is client A's account
+    let agent_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client_a.rng());
+    let agent = AccountBuilder::new(rand_seed(&mut client_a))
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            agent_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client_a.add_account(&agent, false).await?;
+    keystore_a.add_key(&agent_key, agent.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let agent_id = agent.id();
+
+    // Deploy facilitator account (will consume the note via client B)
+    let facilitator_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client_a.rng());
+    let facilitator = AccountBuilder::new(rand_seed(&mut client_a))
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            facilitator_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client_a.add_account(&facilitator, false).await?;
+    keystore_a.add_key(&facilitator_key, facilitator.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let facilitator_id = facilitator.id();
+    // Serialize the facilitator account for client B
+    let facilitator_bytes = facilitator.to_bytes();
+
+    // Deploy merchant
+    let merchant_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client_a.rng());
+    let merchant = AccountBuilder::new(rand_seed(&mut client_a))
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            merchant_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client_a.add_account(&merchant, false).await?;
+    keystore_a.add_key(&merchant_key, merchant.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let merchant_id = merchant.id();
+
+    client_a.sync_state().await?;
+    eprintln!("[cross] step 1: agent={} facilitator={} merchant={}",
+        agent_id.to_hex(), facilitator_id.to_hex(), merchant_id.to_hex());
+
+    // Mint to agent + consume
+    let mint_req = TransactionRequestBuilder::new()
+        .build_mint_fungible_asset(
+            FungibleAsset::new(faucet_id, 10_000).map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            agent_id, NoteType::Public, client_a.rng())
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client_a.submit_new_transaction(faucet_id, mint_req).await?;
+    for attempt in 0..40 {
+        client_a.sync_state().await?;
+        let consumable = client_a.get_consumable_notes(Some(agent_id)).await?;
+        if !consumable.is_empty() {
+            let notes: Vec<_> = consumable.into_iter().map(|(n, _)| n.try_into()).collect::<Result<_, _>>()?;
+            client_a.submit_new_transaction(agent_id,
+                TransactionRequestBuilder::new().build_consume_notes(notes).map_err(|e| anyhow::anyhow!("{e:?}"))?
+            ).await?;
+            break;
+        }
+        if attempt == 39 { anyhow::bail!("timeout"); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    client_a.sync_state().await?;
+    eprintln!("[cross] step 2: agent funded");
+
+    // Create ADN note (agent creates it)
+    let adn_agent_sk = AuthSecretKey::new_falcon512_poseidon2_with_rng(client_a.rng());
+    let adn_agent_pk: Word = adn_agent_sk.public_key().to_commitment().into();
+    let note_script = CodeBuilder::default().compile_note_script(ADN_MASM)?;
+
+    let balance = 1000u64;
+    let amount = 100u64;
+    let asset = FungibleAsset::new(faucet_id, balance).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let storage = NoteStorage::new(vec![
+        adn_agent_pk[0], adn_agent_pk[1], adn_agent_pk[2], adn_agent_pk[3],
+        agent_id.suffix(), agent_id.prefix().as_felt(),
+        Felt::new(1_000_000),
+    ])?;
+    let mut sb = [0u8; 32];
+    client_a.rng().fill_bytes(&mut sb);
+    let serial_num: Word = [
+        Felt::new(u64::from_le_bytes(sb[0..8].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(sb[8..16].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(sb[16..24].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(sb[24..32].try_into().unwrap())),
+    ].into();
+
+    let tag = NoteTag::with_account_target(facilitator_id);
+    let metadata = NoteMetadata::new(agent_id, NoteType::Public).with_tag(tag);
+    let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
+    let recipient = NoteRecipient::new(serial_num, note_script, storage);
+    let note = Note::new(vault, metadata, recipient);
+    let note_id = note.id();
+
+    // Serialize the note (this is what setup-testnet saves as adn_note.b64)
+    let note_bytes = note.to_bytes();
+    eprintln!("[cross] step 3: ADN note built, serialized ({} bytes)", note_bytes.len());
+
+    // Submit on-chain from agent
+    client_a.submit_new_transaction(agent_id,
+        TransactionRequestBuilder::new().own_output_notes(vec![note.clone()]).build().map_err(|e| anyhow::anyhow!("{e:?}"))?
+    ).await?;
+    eprintln!("[cross] step 3: ADN note submitted on-chain, id={note_id}");
+
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    client_a.sync_state().await?;
+
+    // ═══════════════════════════════════════════════════════════════
+    // CLIENT B: separate client that consumes the note (facilitator)
+    // ═══════════════════════════════════════════════════════════════
+    let tmp_b = tempfile::tempdir()?;
+    let (mut client_b, keystore_b) = build_client(tmp_b.path()).await?;
+
+    // Import facilitator account into client B (from serialized bytes)
+    let facilitator_account = miden_protocol::account::Account::read_from_bytes(&facilitator_bytes)
+        .map_err(|e| anyhow::anyhow!("facilitator decode: {e}"))?;
+    client_b.add_account(&facilitator_account, false).await?;
+    // Add the facilitator's key to client B's keystore
+    keystore_b.add_key(&facilitator_key, facilitator_id).await
+        .map_err(|e| anyhow::anyhow!("keystore: {e:?}"))?;
+    eprintln!("[cross] step 4: client B set up with facilitator account");
+
+    // Deserialize the note from bytes (this is what the facilitator does)
+    let deserialized_note = Note::read_from_bytes(&note_bytes)
+        .map_err(|e| anyhow::anyhow!("note decode: {e}"))?;
+    assert_eq!(deserialized_note.id(), note_id, "note ID should survive serialization");
+    eprintln!("[cross] step 4: note deserialized from bytes, id={}", deserialized_note.id());
+
+    // Import note into client B's store
+    let note_details = NoteDetails::new(
+        deserialized_note.assets().clone(),
+        deserialized_note.recipient().clone(),
+    );
+    client_b.import_notes(&[NoteFile::NoteDetails {
+        details: note_details,
+        after_block_num: 0u32.into(),
+        tag: Some(deserialized_note.metadata().tag()),
+    }]).await?;
+
+    // Sync client B
+    client_b.sync_state().await?;
+    eprintln!("[cross] step 5: client B synced");
+
+    // Consume the note from client B (facilitator)
+    let note_args: Word = [
+        merchant_id.suffix(), merchant_id.prefix().as_felt(),
+        Felt::new(amount), Felt::ZERO,
+    ].into();
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+    let sig = adn_agent_sk.sign(message);
+    let prepared: Vec<Felt> = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[adn_agent_pk.into(), message.into()]).into();
+
+    eprintln!("[cross] step 6: consuming from client B (facilitator pattern)...");
+
+    let consume_req = TransactionRequestBuilder::new()
+        .input_notes([(deserialized_note, Some(note_args))])
+        .extend_advice_map([(sig_key, prepared.as_slice())])
+        .build()
+        .map_err(|e| anyhow::anyhow!("consume tx: {e:?}"))?;
+
+    match client_b.submit_new_transaction(facilitator_id, consume_req).await {
+        Ok(tx_id) => {
+            eprintln!("[cross] SUCCESS! tx_id={tx_id}");
+            eprintln!("        Cross-client ADN settlement works!");
+        }
+        Err(e) => {
+            let err_str = format!("{e:?}");
+            eprintln!("[cross] FAILED: {err_str}");
+            if err_str.contains("StackReadFailed") {
+                eprintln!("[cross] Confirmed: cross-client pattern causes StackReadFailed!");
+                eprintln!("        Same note works when consumed by the creating client.");
+                eprintln!("        Fails when deserialized + consumed by a different client.");
+            }
+        }
+    }
+
+    Ok(())
+}
