@@ -33,6 +33,7 @@ use miden_standards::code_builder::CodeBuilder;
 use rand::RngCore;
 
 const NOTE_MASM: &str = include_str!("../masm/secret_hash_note.masm");
+const FALCON_P2ID_MASM: &str = include_str!("../masm/falcon_p2id_note.masm");
 
 /// The secret that the note consumer must know.
 fn secret() -> Word {
@@ -344,6 +345,226 @@ async fn real_noop_transaction_succeeds() -> anyhow::Result<()> {
         .await?;
     eprintln!("Noop transaction succeeded: {tx_id}");
     eprintln!("This proves the client setup is correct — only custom note consumption fails.");
+
+    Ok(())
+}
+
+/// This test reproduces StackReadFailed with a Falcon-signed note that creates
+/// a P2ID output note — the full pattern used in AgentDebitNote.
+///
+/// The simple secret_hash note (test above) PASSES on main. This one FAILS.
+#[tokio::test]
+#[ignore = "requires network access to Miden testnet"]
+async fn real_falcon_p2id_note() -> anyhow::Result<()> {
+    use miden_protocol::vm::AdviceInputs;
+
+    let tmp = tempfile::tempdir()?;
+    let data_dir = tmp.path();
+    let (mut client, keystore) = build_client(data_dir).await?;
+
+    client.sync_state().await?;
+    eprintln!("step 0: client synced");
+
+    // ── 1. Deploy faucet ──
+    let faucet_seed = rand_seed(&mut client);
+    let faucet_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let symbol = TokenSymbol::new("FTEST")
+        .map_err(|e| anyhow::anyhow!("TokenSymbol: {e:?}"))?;
+    let max_supply = Felt::new(1_000_000_000);
+    let faucet = AccountBuilder::new(faucet_seed)
+        .account_type(AccountType::FungibleFaucet)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            faucet_key.public_key().to_commitment().into(),
+            AuthSchemeId::Falcon512Poseidon2,
+        ))
+        .with_component(
+            BasicFungibleFaucet::new(symbol, 6, max_supply)
+                .map_err(|e| anyhow::anyhow!("BasicFungibleFaucet: {e:?}"))?,
+        )
+        .with_component(AuthControlled::allow_all())
+        .build()
+        .map_err(|e| anyhow::anyhow!("faucet build: {e:?}"))?;
+    client.add_account(&faucet, false).await?;
+    keystore.add_key(&faucet_key, faucet.id()).await
+        .map_err(|e| anyhow::anyhow!("faucet keystore: {e:?}"))?;
+    let faucet_id = faucet.id();
+    eprintln!("step 1: faucet deployed: {}", faucet_id.to_hex());
+
+    client.sync_state().await?;
+
+    // ── 2. Deploy consumer wallet ──
+    let consumer_seed = rand_seed(&mut client);
+    let consumer_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let consumer = AccountBuilder::new(consumer_seed)
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            consumer_key.public_key().to_commitment().into(),
+            AuthSchemeId::Falcon512Poseidon2,
+        ))
+        .with_component(BasicWallet)
+        .build()
+        .map_err(|e| anyhow::anyhow!("consumer build: {e:?}"))?;
+    client.add_account(&consumer, false).await?;
+    keystore.add_key(&consumer_key, consumer.id()).await
+        .map_err(|e| anyhow::anyhow!("consumer keystore: {e:?}"))?;
+    let consumer_id = consumer.id();
+    eprintln!("step 2: consumer wallet deployed: {}", consumer_id.to_hex());
+
+    // ── 3. Deploy target wallet (P2ID recipient) ──
+    let target_seed = rand_seed(&mut client);
+    let target_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let target = AccountBuilder::new(target_seed)
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            target_key.public_key().to_commitment().into(),
+            AuthSchemeId::Falcon512Poseidon2,
+        ))
+        .with_component(BasicWallet)
+        .build()
+        .map_err(|e| anyhow::anyhow!("target build: {e:?}"))?;
+    client.add_account(&target, false).await?;
+    keystore.add_key(&target_key, target.id()).await
+        .map_err(|e| anyhow::anyhow!("target keystore: {e:?}"))?;
+    let target_id = target.id();
+    eprintln!("step 3: target wallet deployed: {}", target_id.to_hex());
+
+    client.sync_state().await?;
+
+    // ── 4. Mint tokens to consumer ──
+    let mint_asset = FungibleAsset::new(faucet_id, 10_000)
+        .map_err(|e| anyhow::anyhow!("FungibleAsset: {e:?}"))?;
+    let mint_req = TransactionRequestBuilder::new()
+        .build_mint_fungible_asset(mint_asset, consumer_id, NoteType::Public, client.rng())
+        .map_err(|e| anyhow::anyhow!("mint tx: {e:?}"))?;
+    let mint_tx = client.submit_new_transaction(faucet_id, mint_req).await?;
+    eprintln!("step 4: mint submitted: {mint_tx}");
+
+    // ── 5. Wait + consume mint note ──
+    eprintln!("step 5: waiting for mint note...");
+    for attempt in 0..40 {
+        client.sync_state().await?;
+        let consumable = client.get_consumable_notes(Some(consumer_id)).await?;
+        if !consumable.is_empty() {
+            let notes: Vec<_> = consumable.into_iter()
+                .map(|(note, _)| note.try_into())
+                .collect::<Result<_, _>>()?;
+            let consume_req = TransactionRequestBuilder::new()
+                .build_consume_notes(notes)
+                .map_err(|e| anyhow::anyhow!("consume: {e:?}"))?;
+            let consume_tx = client.submit_new_transaction(consumer_id, consume_req).await?;
+            eprintln!("step 5: mint consumed: {consume_tx}");
+            break;
+        }
+        if attempt == 39 { anyhow::bail!("timeout waiting for mint note"); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    client.sync_state().await?;
+
+    // ── 6. Create the Falcon + P2ID note ──
+    let agent_sk = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let agent_pk: Word = agent_sk.public_key().to_commitment().into();
+
+    let note_script = CodeBuilder::default().compile_note_script(FALCON_P2ID_MASM)?;
+    eprintln!("step 6: falcon+p2id note script compiled");
+
+    let amount = 500u64;
+    let asset = FungibleAsset::new(faucet_id, 1000)
+        .map_err(|e| anyhow::anyhow!("asset: {e:?}"))?;
+
+    // Storage: [agent_pk(4), target_suffix, target_prefix]
+    let storage = NoteStorage::new(vec![
+        agent_pk[0], agent_pk[1], agent_pk[2], agent_pk[3],
+        target_id.suffix(), target_id.prefix().as_felt(),
+    ])?;
+
+    let mut serial_bytes = [0u8; 32];
+    client.rng().fill_bytes(&mut serial_bytes);
+    let serial_num: Word = [
+        Felt::new(u64::from_le_bytes(serial_bytes[0..8].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(serial_bytes[8..16].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(serial_bytes[16..24].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(serial_bytes[24..32].try_into().unwrap())),
+    ].into();
+
+    let tag = NoteTag::with_account_target(consumer_id);
+    let metadata = NoteMetadata::new(consumer_id, NoteType::Public).with_tag(tag);
+    let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
+    let recipient = NoteRecipient::new(serial_num, note_script, storage);
+    let note = Note::new(vault, metadata, recipient);
+    let note_id = note.id();
+    eprintln!("step 6: note built, id={note_id}");
+
+    // Submit on-chain
+    let create_req = TransactionRequestBuilder::new()
+        .own_output_notes(vec![note.clone()])
+        .build()
+        .map_err(|e| anyhow::anyhow!("create note tx: {e:?}"))?;
+    let create_tx = client.submit_new_transaction(consumer_id, create_req).await?;
+    eprintln!("step 6: note submitted: {create_tx}");
+
+    // ── 7. Wait for note to be on-chain ──
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
+    let note_file = NoteFile::NoteDetails {
+        details: note_details,
+        after_block_num: 0u32.into(),
+        tag: Some(tag),
+    };
+    client.import_notes(&[note_file]).await?;
+
+    eprintln!("step 7: waiting for note to sync...");
+    for attempt in 0..40 {
+        client.sync_state().await?;
+        let consumable = client.get_consumable_notes(Some(consumer_id)).await?;
+        if consumable.iter().any(|(n, _)| n.id() == note_id) {
+            eprintln!("step 7: note is consumable (attempt {attempt})");
+            break;
+        }
+        if attempt == 39 { eprintln!("WARNING: note never became consumable, trying anyway..."); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // ── 8. Consume with Falcon signature + advice map ──
+    eprintln!("step 8: syncing before consume...");
+    client.sync_state().await?;
+
+    // Compute message = merge(serial_num, [amount, 0, 0, 0])
+    let note_args: Word = [Felt::new(amount), Felt::ZERO, Felt::ZERO, Felt::ZERO].into();
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+
+    // Sign + put in advice map at key = merge(AGENT_PK, MESSAGE)
+    let sig = agent_sk.sign(message);
+    let prepared: Vec<Felt> = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    eprintln!("step 8: attempting consume with Falcon sig in advice map...");
+    eprintln!("        (this is where StackReadFailed occurs)");
+
+    let consume_req = TransactionRequestBuilder::new()
+        .input_notes([(note, Some(note_args))])
+        .extend_advice_map([(sig_key, prepared.as_slice())])
+        .build()
+        .map_err(|e| anyhow::anyhow!("consume tx: {e:?}"))?;
+
+    match client.submit_new_transaction(consumer_id, consume_req).await {
+        Ok(tx_id) => {
+            eprintln!("step 8: SUCCESS! tx_id={tx_id}");
+            eprintln!("        The bug is fixed!");
+        }
+        Err(e) => {
+            let err_str = format!("{e:?}");
+            eprintln!("step 8: FAILED:");
+            eprintln!("        {err_str}");
+            if err_str.contains("StackReadFailed") {
+                eprintln!("        Confirmed: StackReadFailed reproduced!");
+                eprintln!("        Falcon sig + P2ID output note pattern fails on real client.");
+            }
+        }
+    }
 
     Ok(())
 }
