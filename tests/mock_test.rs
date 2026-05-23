@@ -16,6 +16,7 @@ use miden_testing::{Auth, MockChain};
 
 const SIMPLE_MASM: &str = include_str!("../masm/secret_hash_note.masm");
 const FALCON_P2ID_MASM: &str = include_str!("../masm/falcon_p2id_note.masm");
+const FALCON_P2ID_HASMAPKEY_MASM: &str = include_str!("../masm/falcon_p2id_hasmapkey_note.masm");
 
 // ── Helpers ──
 
@@ -230,5 +231,61 @@ async fn mock_falcon_p2id_wrong_sig_rejected() -> anyhow::Result<()> {
 
     assert!(tx.execute().await.is_err(), "wrong Falcon sig should be rejected");
     println!("PASSED: wrong Falcon signature correctly rejected");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Test 5: Falcon + P2ID + adv.has_mapkey (the ADN pattern)
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn mock_falcon_p2id_hasmapkey() -> anyhow::Result<()> {
+    let note_script = CodeBuilder::default().compile_note_script(FALCON_P2ID_HASMAPKEY_MASM)?;
+    let agent_sk = make_falcon_keypair(55);
+    let agent_pk: Word = agent_sk.public_key().to_commitment().into();
+
+    let mut builder = MockChain::builder();
+    let consumer = builder.add_existing_wallet(Auth::IncrNonce)?;
+    let faucet = builder.add_existing_basic_faucet(Auth::IncrNonce, "TEST", 1_000_000, None)?;
+    let target = builder.add_existing_wallet(Auth::Noop)?;
+
+    let amount = 500u64;
+    let asset = FungibleAsset::new(faucet.id(), 1000)?;
+    let storage = NoteStorage::new(vec![
+        agent_pk[0], agent_pk[1], agent_pk[2], agent_pk[3],
+        target.id().suffix(), target.id().prefix().as_felt(),
+    ])?;
+
+    let serial_num: Word = [Felt::new(555), Felt::new(666), Felt::new(777), Felt::new(888)].into();
+    let metadata = NoteMetadata::new(consumer.id(), NoteType::Public).with_tag(NoteTag::new(0));
+    let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
+    let recipient = NoteRecipient::new(serial_num, note_script.clone(), storage);
+    let note = Note::new(vault, metadata, recipient);
+    let note_id = note.id();
+
+    builder.add_output_note(RawOutputNote::Full(note));
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    let note_args: Word = [Felt::new(amount), Felt::ZERO, Felt::ZERO, Felt::ZERO].into();
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+    let sig = agent_sk.sign(message);
+    let prepared = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    let advice = AdviceInputs::default().with_map([(sig_key, prepared)]);
+    let mut args = BTreeMap::new();
+    args.insert(note_id, note_args);
+
+    let tx = mock_chain
+        .build_tx_context(consumer.id(), &[note_id], &[])?
+        .extend_note_args(args)
+        .add_note_script(note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let executed = tx.execute().await?;
+    assert_eq!(executed.output_notes().num_notes(), 1, "expected P2ID output note");
+    println!("PASSED: Falcon + P2ID + has_mapkey pattern works in MockChain");
     Ok(())
 }

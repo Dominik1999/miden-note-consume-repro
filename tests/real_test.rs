@@ -34,6 +34,7 @@ use rand::RngCore;
 
 const NOTE_MASM: &str = include_str!("../masm/secret_hash_note.masm");
 const FALCON_P2ID_MASM: &str = include_str!("../masm/falcon_p2id_note.masm");
+const FALCON_P2ID_HASMAPKEY_MASM: &str = include_str!("../masm/falcon_p2id_hasmapkey_note.masm");
 
 /// The secret that the note consumer must know.
 fn secret() -> Word {
@@ -562,6 +563,167 @@ async fn real_falcon_p2id_note() -> anyhow::Result<()> {
             if err_str.contains("StackReadFailed") {
                 eprintln!("        Confirmed: StackReadFailed reproduced!");
                 eprintln!("        Falcon sig + P2ID output note pattern fails on real client.");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Same as real_falcon_p2id_note but uses adv.has_mapkey to check for the
+/// signature before reading it. This matches the AgentDebitNote pattern.
+/// If real_falcon_p2id_note passes but this fails, adv.has_mapkey is the culprit.
+#[tokio::test]
+#[ignore = "requires network access to Miden testnet"]
+async fn real_falcon_p2id_hasmapkey_note() -> anyhow::Result<()> {
+    use miden_protocol::vm::AdviceInputs;
+
+    let tmp = tempfile::tempdir()?;
+    let data_dir = tmp.path();
+    let (mut client, keystore) = build_client(data_dir).await?;
+    client.sync_state().await?;
+    eprintln!("[hasmapkey] step 0: synced");
+
+    // Deploy faucet
+    let faucet_seed = rand_seed(&mut client);
+    let faucet_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let symbol = TokenSymbol::new("HMTEST").map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let faucet = AccountBuilder::new(faucet_seed)
+        .account_type(AccountType::FungibleFaucet)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            faucet_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2,
+        ))
+        .with_component(BasicFungibleFaucet::new(symbol, 6, Felt::new(1_000_000_000)).map_err(|e| anyhow::anyhow!("{e:?}"))?)
+        .with_component(AuthControlled::allow_all())
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.add_account(&faucet, false).await?;
+    keystore.add_key(&faucet_key, faucet.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let faucet_id = faucet.id();
+    eprintln!("[hasmapkey] step 1: faucet {}", faucet_id.to_hex());
+
+    // Deploy consumer + target
+    let consumer_seed = rand_seed(&mut client);
+    let consumer_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let consumer = AccountBuilder::new(consumer_seed)
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            consumer_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2,
+        ))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.add_account(&consumer, false).await?;
+    keystore.add_key(&consumer_key, consumer.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let consumer_id = consumer.id();
+
+    let target_seed = rand_seed(&mut client);
+    let target_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let target = AccountBuilder::new(target_seed)
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            target_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2,
+        ))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.add_account(&target, false).await?;
+    keystore.add_key(&target_key, target.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let target_id = target.id();
+    client.sync_state().await?;
+    eprintln!("[hasmapkey] step 2: consumer={} target={}", consumer_id.to_hex(), target_id.to_hex());
+
+    // Mint + consume
+    let mint_asset = FungibleAsset::new(faucet_id, 10_000).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let mint_req = TransactionRequestBuilder::new()
+        .build_mint_fungible_asset(mint_asset, consumer_id, NoteType::Public, client.rng())
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.submit_new_transaction(faucet_id, mint_req).await?;
+    eprintln!("[hasmapkey] step 3: mint submitted");
+
+    for attempt in 0..40 {
+        client.sync_state().await?;
+        let consumable = client.get_consumable_notes(Some(consumer_id)).await?;
+        if !consumable.is_empty() {
+            let notes: Vec<_> = consumable.into_iter().map(|(n, _)| n.try_into()).collect::<Result<_, _>>()?;
+            let req = TransactionRequestBuilder::new().build_consume_notes(notes).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            client.submit_new_transaction(consumer_id, req).await?;
+            eprintln!("[hasmapkey] step 4: mint consumed");
+            break;
+        }
+        if attempt == 39 { anyhow::bail!("timeout"); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    client.sync_state().await?;
+
+    // Create the hasmapkey note
+    let agent_sk = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let agent_pk: Word = agent_sk.public_key().to_commitment().into();
+    let note_script = CodeBuilder::default().compile_note_script(FALCON_P2ID_HASMAPKEY_MASM)?;
+
+    let amount = 500u64;
+    let asset = FungibleAsset::new(faucet_id, 1000).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let storage = NoteStorage::new(vec![
+        agent_pk[0], agent_pk[1], agent_pk[2], agent_pk[3],
+        target_id.suffix(), target_id.prefix().as_felt(),
+    ])?;
+    let mut serial_bytes = [0u8; 32];
+    client.rng().fill_bytes(&mut serial_bytes);
+    let serial_num: Word = [
+        Felt::new(u64::from_le_bytes(serial_bytes[0..8].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(serial_bytes[8..16].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(serial_bytes[16..24].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(serial_bytes[24..32].try_into().unwrap())),
+    ].into();
+
+    let tag = NoteTag::with_account_target(consumer_id);
+    let metadata = NoteMetadata::new(consumer_id, NoteType::Public).with_tag(tag);
+    let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
+    let recipient = NoteRecipient::new(serial_num, note_script, storage);
+    let note = Note::new(vault, metadata, recipient);
+    let note_id = note.id();
+
+    let create_req = TransactionRequestBuilder::new().own_output_notes(vec![note.clone()]).build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.submit_new_transaction(consumer_id, create_req).await?;
+    eprintln!("[hasmapkey] step 5: note submitted on-chain, id={note_id}");
+
+    // Import + wait
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
+    client.import_notes(&[NoteFile::NoteDetails { details: note_details, after_block_num: 0u32.into(), tag: Some(tag) }]).await?;
+    for attempt in 0..40 {
+        client.sync_state().await?;
+        let consumable = client.get_consumable_notes(Some(consumer_id)).await?;
+        if consumable.iter().any(|(n, _)| n.id() == note_id) {
+            eprintln!("[hasmapkey] step 6: note consumable (attempt {attempt})");
+            break;
+        }
+        if attempt == 39 { eprintln!("WARNING: note never became consumable"); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Consume with has_mapkey pattern
+    client.sync_state().await?;
+    let note_args: Word = [Felt::new(amount), Felt::ZERO, Felt::ZERO, Felt::ZERO].into();
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+    let sig = agent_sk.sign(message);
+    let prepared: Vec<Felt> = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    eprintln!("[hasmapkey] step 7: consuming with adv.has_mapkey pattern...");
+
+    let consume_req = TransactionRequestBuilder::new()
+        .input_notes([(note, Some(note_args))])
+        .extend_advice_map([(sig_key, prepared.as_slice())])
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    match client.submit_new_transaction(consumer_id, consume_req).await {
+        Ok(tx_id) => eprintln!("[hasmapkey] step 7: SUCCESS! tx_id={tx_id}"),
+        Err(e) => {
+            let err_str = format!("{e:?}");
+            eprintln!("[hasmapkey] step 7: FAILED: {err_str}");
+            if err_str.contains("StackReadFailed") {
+                eprintln!("[hasmapkey] Confirmed: adv.has_mapkey pattern causes StackReadFailed!");
             }
         }
     }
