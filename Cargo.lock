@@ -2060,6 +2060,7 @@ name = "miden-note-consume-repro"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "miden-client",
  "miden-client-sqlite-store",
  "miden-protocol",
@@ -2069,6 +2070,7 @@ dependencies = [
  "rand_chacha",
  "tempfile",
  "tokio",
+ "toml 0.8.23",
 ]
 
 [[package]]
