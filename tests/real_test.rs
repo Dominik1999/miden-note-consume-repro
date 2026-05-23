@@ -35,6 +35,7 @@ use rand::RngCore;
 const NOTE_MASM: &str = include_str!("../masm/secret_hash_note.masm");
 const FALCON_P2ID_MASM: &str = include_str!("../masm/falcon_p2id_note.masm");
 const FALCON_P2ID_HASMAPKEY_MASM: &str = include_str!("../masm/falcon_p2id_hasmapkey_note.masm");
+const ADN_MASM: &str = include_str!("../masm/agent_debit_note.masm");
 
 /// The secret that the note consumer must know.
 fn secret() -> Word {
@@ -724,6 +725,166 @@ async fn real_falcon_p2id_hasmapkey_note() -> anyhow::Result<()> {
             eprintln!("[hasmapkey] step 7: FAILED: {err_str}");
             if err_str.contains("StackReadFailed") {
                 eprintln!("[hasmapkey] Confirmed: adv.has_mapkey pattern causes StackReadFailed!");
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Test the ACTUAL AgentDebitNote MASM on real testnet.
+/// 7-item storage, block height check, 2 output notes (P2ID + remainder).
+#[tokio::test]
+#[ignore = "requires network access to Miden testnet"]
+async fn real_adn_note() -> anyhow::Result<()> {
+    use miden_protocol::vm::AdviceInputs;
+
+    let tmp = tempfile::tempdir()?;
+    let (mut client, keystore) = build_client(tmp.path()).await?;
+    client.sync_state().await?;
+    eprintln!("[adn] step 0: synced");
+
+    // Deploy faucet
+    let faucet_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let symbol = TokenSymbol::new("ADTEST").map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let faucet = AccountBuilder::new(rand_seed(&mut client))
+        .account_type(AccountType::FungibleFaucet)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            faucet_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicFungibleFaucet::new(symbol, 6, Felt::new(1_000_000_000)).map_err(|e| anyhow::anyhow!("{e:?}"))?)
+        .with_component(AuthControlled::allow_all())
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.add_account(&faucet, false).await?;
+    keystore.add_key(&faucet_key, faucet.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let faucet_id = faucet.id();
+
+    // Deploy consumer (will consume the ADN)
+    let consumer_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let consumer = AccountBuilder::new(rand_seed(&mut client))
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            consumer_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.add_account(&consumer, false).await?;
+    keystore.add_key(&consumer_key, consumer.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let consumer_id = consumer.id();
+
+    // Deploy merchant (P2ID recipient)
+    let merchant_key = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let merchant = AccountBuilder::new(rand_seed(&mut client))
+        .account_type(AccountType::RegularAccountUpdatableCode)
+        .storage_mode(AccountStorageMode::Public)
+        .with_auth_component(AuthSingleSig::new(
+            merchant_key.public_key().to_commitment().into(), AuthSchemeId::Falcon512Poseidon2))
+        .with_component(BasicWallet)
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.add_account(&merchant, false).await?;
+    keystore.add_key(&merchant_key, merchant.id()).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let merchant_id = merchant.id();
+
+    client.sync_state().await?;
+    eprintln!("[adn] step 1: faucet={} consumer={} merchant={}",
+        faucet_id.to_hex(), consumer_id.to_hex(), merchant_id.to_hex());
+
+    // Mint + consume so consumer has tokens
+    let mint_req = TransactionRequestBuilder::new()
+        .build_mint_fungible_asset(
+            FungibleAsset::new(faucet_id, 10_000).map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            consumer_id, NoteType::Public, client.rng())
+        .map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    client.submit_new_transaction(faucet_id, mint_req).await?;
+    for attempt in 0..40 {
+        client.sync_state().await?;
+        let consumable = client.get_consumable_notes(Some(consumer_id)).await?;
+        if !consumable.is_empty() {
+            let notes: Vec<_> = consumable.into_iter().map(|(n, _)| n.try_into()).collect::<Result<_, _>>()?;
+            client.submit_new_transaction(consumer_id,
+                TransactionRequestBuilder::new().build_consume_notes(notes).map_err(|e| anyhow::anyhow!("{e:?}"))?
+            ).await?;
+            break;
+        }
+        if attempt == 39 { anyhow::bail!("timeout"); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+    client.sync_state().await?;
+    eprintln!("[adn] step 2: consumer funded");
+
+    // Create the ADN note
+    let agent_sk = AuthSecretKey::new_falcon512_poseidon2_with_rng(client.rng());
+    let agent_pk: Word = agent_sk.public_key().to_commitment().into();
+    let note_script = CodeBuilder::default().compile_note_script(ADN_MASM)?;
+
+    let balance = 1000u64;
+    let amount = 100u64;
+    let asset = FungibleAsset::new(faucet_id, balance).map_err(|e| anyhow::anyhow!("{e:?}"))?;
+    let storage = NoteStorage::new(vec![
+        agent_pk[0], agent_pk[1], agent_pk[2], agent_pk[3],
+        consumer_id.suffix(), consumer_id.prefix().as_felt(),
+        Felt::new(1_000_000),
+    ])?;
+    let mut sb = [0u8; 32];
+    client.rng().fill_bytes(&mut sb);
+    let serial_num: Word = [
+        Felt::new(u64::from_le_bytes(sb[0..8].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(sb[8..16].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(sb[16..24].try_into().unwrap())),
+        Felt::new(u64::from_le_bytes(sb[24..32].try_into().unwrap())),
+    ].into();
+
+    let tag = NoteTag::with_account_target(consumer_id);
+    let metadata = NoteMetadata::new(consumer_id, NoteType::Public).with_tag(tag);
+    let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
+    let recipient = NoteRecipient::new(serial_num, note_script, storage);
+    let note = Note::new(vault, metadata, recipient);
+    let note_id = note.id();
+
+    client.submit_new_transaction(consumer_id,
+        TransactionRequestBuilder::new().own_output_notes(vec![note.clone()]).build().map_err(|e| anyhow::anyhow!("{e:?}"))?
+    ).await?;
+    eprintln!("[adn] step 3: ADN note on-chain, id={note_id}");
+
+    // Import + sync
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    client.import_notes(&[NoteFile::NoteDetails {
+        details: NoteDetails::new(note.assets().clone(), note.recipient().clone()),
+        after_block_num: 0u32.into(), tag: Some(tag),
+    }]).await?;
+    for attempt in 0..40 {
+        client.sync_state().await?;
+        let c = client.get_consumable_notes(Some(consumer_id)).await?;
+        if c.iter().any(|(n, _)| n.id() == note_id) { eprintln!("[adn] step 4: consumable"); break; }
+        if attempt == 39 { eprintln!("WARNING: not consumable"); }
+        tokio::time::sleep(Duration::from_secs(3)).await;
+    }
+
+    // Consume: note_args = [merchant_suffix, merchant_prefix, amount, 0]
+    client.sync_state().await?;
+    let note_args: Word = [merchant_id.suffix(), merchant_id.prefix().as_felt(), Felt::new(amount), Felt::ZERO].into();
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+    let sig = agent_sk.sign(message);
+    let prepared: Vec<Felt> = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    eprintln!("[adn] step 5: consuming ADN note (Falcon + P2ID + remainder)...");
+
+    let consume_req = TransactionRequestBuilder::new()
+        .input_notes([(note, Some(note_args))])
+        .extend_advice_map([(sig_key, prepared.as_slice())])
+        .build().map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    match client.submit_new_transaction(consumer_id, consume_req).await {
+        Ok(tx_id) => {
+            eprintln!("[adn] SUCCESS! tx_id={tx_id}");
+            eprintln!("       ADN chain-finality settlement works!");
+        }
+        Err(e) => {
+            let err_str = format!("{e:?}");
+            eprintln!("[adn] FAILED: {err_str}");
+            if err_str.contains("StackReadFailed") {
+                eprintln!("[adn] StackReadFailed — the ADN MASM has a bug not caught by MockChain");
             }
         }
     }

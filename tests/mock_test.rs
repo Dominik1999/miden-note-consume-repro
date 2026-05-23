@@ -17,6 +17,7 @@ use miden_testing::{Auth, MockChain};
 const SIMPLE_MASM: &str = include_str!("../masm/secret_hash_note.masm");
 const FALCON_P2ID_MASM: &str = include_str!("../masm/falcon_p2id_note.masm");
 const FALCON_P2ID_HASMAPKEY_MASM: &str = include_str!("../masm/falcon_p2id_hasmapkey_note.masm");
+const ADN_MASM: &str = include_str!("../masm/agent_debit_note.masm");
 
 // ── Helpers ──
 
@@ -287,5 +288,80 @@ async fn mock_falcon_p2id_hasmapkey() -> anyhow::Result<()> {
     let executed = tx.execute().await?;
     assert_eq!(executed.output_notes().num_notes(), 1, "expected P2ID output note");
     println!("PASSED: Falcon + P2ID + has_mapkey pattern works in MockChain");
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Test 6: Actual AgentDebitNote MASM (7-item storage, block check,
+//         2 output notes: P2ID + remainder)
+// ═══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn mock_adn_consume() -> anyhow::Result<()> {
+    use miden_protocol::account::AccountId;
+
+    let note_script = CodeBuilder::default().compile_note_script(ADN_MASM)?;
+    let agent_sk = make_falcon_keypair(77);
+    let agent_pk: Word = agent_sk.public_key().to_commitment().into();
+
+    let mut builder = MockChain::builder();
+    let consumer = builder.add_existing_wallet(Auth::IncrNonce)?;
+    let faucet = builder.add_existing_basic_faucet(Auth::IncrNonce, "USDC", 1_000_000, None)?;
+    let merchant = builder.add_existing_wallet(Auth::Noop)?;
+    let user = builder.add_existing_wallet(Auth::Noop)?;
+
+    let balance = 1000u64;
+    let amount = 100u64;
+    let expiry = 1_000_000u32;
+
+    let asset = FungibleAsset::new(faucet.id(), balance)?;
+    // 7-item storage: [agent_pk(4), user_suffix, user_prefix, expiry]
+    let storage = NoteStorage::new(vec![
+        agent_pk[0], agent_pk[1], agent_pk[2], agent_pk[3],
+        user.id().suffix(), user.id().prefix().as_felt(),
+        Felt::new(expiry as u64),
+    ])?;
+
+    let serial_num: Word = [Felt::new(77), Felt::new(88), Felt::new(99), Felt::new(111)].into();
+    let metadata = NoteMetadata::new(consumer.id(), NoteType::Public).with_tag(NoteTag::new(0));
+    let vault = NoteAssets::new(vec![Asset::Fungible(asset)])?;
+    let recipient = NoteRecipient::new(serial_num, note_script.clone(), storage);
+    let note = Note::new(vault, metadata, recipient);
+    let note_id = note.id();
+
+    builder.add_output_note(RawOutputNote::Full(note));
+    let mut mock_chain = builder.build()?;
+    mock_chain.prove_next_block()?;
+
+    // note_args: [merchant_suffix, merchant_prefix, amount, 0]
+    let note_args: Word = [
+        merchant.id().suffix(), merchant.id().prefix().as_felt(),
+        Felt::new(amount), Felt::ZERO,
+    ].into();
+
+    // message = merge(serial_num, note_args)
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+
+    // Sign and put in advice map
+    let sig = agent_sk.sign(message);
+    let prepared = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    let advice = AdviceInputs::default().with_map([(sig_key, prepared)]);
+
+    let mut args = BTreeMap::new();
+    args.insert(note_id, note_args);
+
+    let tx = mock_chain
+        .build_tx_context(consumer.id(), &[note_id], &[])?
+        .extend_note_args(args)
+        .add_note_script(note_script)
+        .extend_advice_inputs(advice)
+        .build()?;
+
+    let executed = tx.execute().await?;
+    // ADN produces 2 output notes: P2ID to merchant + remainder ADN
+    assert_eq!(executed.output_notes().num_notes(), 2, "expected P2ID + remainder");
+    println!("PASSED: actual ADN MASM works in MockChain (2 output notes)");
     Ok(())
 }
