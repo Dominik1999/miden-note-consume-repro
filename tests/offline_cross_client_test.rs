@@ -215,14 +215,21 @@ async fn offline_cross_client_adn() -> anyhow::Result<()> {
     client_a.sync_state().await?;
     eprintln!("[offline] ADN note on-chain: {} ({} bytes serialized)", note_id, note_bytes.len());
 
+    // Prove many extra blocks to simulate a long chain (like testnet at block ~978K)
+    // This tests whether having many blocks in the partial blockchain affects execution
+    let extra_blocks = std::env::var("EXTRA_BLOCKS").unwrap_or("0".into()).parse::<u32>().unwrap_or(0);
+    if extra_blocks > 0 {
+        eprintln!("[offline] proving {extra_blocks} extra blocks to simulate long chain...");
+        for _ in 0..extra_blocks {
+            rpc_a.prove_block();
+        }
+        client_a.sync_state().await?;
+        eprintln!("[offline] chain now at block {}", rpc_a.get_chain_tip_block_num());
+    }
+
     // ═══════════════════════════════════════════════════════════════
-    // CLIENT B: separate client with its OWN MockChain (note NOT in this chain)
-    // This simulates the facilitator pattern where the consuming client
-    // connects to a chain that has the note but the client only knows about
-    // it from imported bytes.
+    // CLIENT B: separate client, same MockChain
     // ═══════════════════════════════════════════════════════════════
-    // Use the SAME shared MockChain so client B can discover the note during sync
-    // (the note IS on-chain, just like on testnet)
     let (mut client_b, _rpc_b, keystore_b): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore) = create_mock_client(rpc.clone()).await?;
 
     // Import facilitator account from serialized bytes
