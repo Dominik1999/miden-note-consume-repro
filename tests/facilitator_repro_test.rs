@@ -98,9 +98,18 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
         tag: Some(tag),
     }]).await?;
 
-    // Initial sync
+    // Sync — try multiple times to fill MMR gaps
     let sync = client.sync_state().await?;
-    eprintln!("synced to block {}", sync.block_num);
+    eprintln!("sync 1: block {}", sync.block_num);
+
+    if std::env::var("MULTI_SYNC").is_ok() {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let sync2 = client.sync_state().await?;
+        eprintln!("sync 2: block {}", sync2.block_num);
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let sync3 = client.sync_state().await?;
+        eprintln!("sync 3: block {}", sync3.block_num);
+    }
 
     // Check note state
     match client.get_input_note(note_id).await {
@@ -176,6 +185,20 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     let sig = agent_sk.sign(message);
     let prepared: Vec<Felt> = sig.to_prepared_signature(message);
     let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    // Dump store state for debugging — copy to a stable location
+    let debug_store = std::path::PathBuf::from("/tmp/facilitator_debug_store.sqlite3");
+    let _ = std::fs::copy(data_dir.join("store.sqlite3"), &debug_store);
+    eprintln!("store copied to: {}", debug_store.display());
+    {
+        let out = std::process::Command::new("sqlite3")
+            .arg(data_dir.join("store.sqlite3"))
+            .arg("SELECT 'block_headers=' || COUNT(*) FROM block_headers; SELECT 'mmr_nodes=' || COUNT(*) FROM partial_blockchain_nodes; SELECT 'sync_height=' || block_num FROM state_sync; SELECT 'input_notes=' || COUNT(*) FROM input_notes; SELECT 'notes_scripts=' || COUNT(*) FROM notes_scripts;")
+            .output();
+        if let Ok(o) = out {
+            eprintln!("store stats: {}", String::from_utf8_lossy(&o.stdout).trim());
+        }
+    }
 
     eprintln!("attempting consume (with Falcon sig in advice map)...");
     eprintln!("  sig_key={sig_key:?} prepared_len={}", prepared.len());
