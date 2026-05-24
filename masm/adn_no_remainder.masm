@@ -1,0 +1,177 @@
+#! AgentDebitNote (no remainder) — simplified ADN for debugging.
+#!
+#! Identical to agent_debit_note.masm but WITHOUT section 7 (remainder
+#! note creation). This isolates whether the StackReadFailed is caused
+#! by the second output note (build_recipient + output_note::create +
+#! second move_asset_to_note) or by something else in the ADN logic.
+#!
+#! Note storage (7 items at STORAGE_PTR):
+#!   [0-3]  agent_pubkey_commitment (Word)
+#!   [4]    user_account_id_suffix
+#!   [5]    user_account_id_prefix
+#!   [6]    expiry_block_height
+#!
+#! Note args:
+#!   Consume: [merchant_suffix, merchant_prefix, amount, 0]
+#!   Reclaim: [0, 0, 0, 0]
+#!
+#! Advice stack (consume): [agent_prepared_sig...]
+#! Advice stack (reclaim): [agent_prepared_sig...]
+
+use miden::protocol::active_note
+use miden::protocol::note
+use miden::protocol::output_note
+use miden::protocol::tx
+use miden::core::sys
+use miden::core::crypto::dsa::falcon512_poseidon2
+use miden::core::crypto::hashes::poseidon2
+use miden::standards::wallets::basic->wallet
+use miden::standards::notes::p2id
+
+# ── Memory layout ──
+
+const STORAGE_PTR=100
+const AGENT_PK_PTR=100
+const USER_SUFFIX_PTR=104
+const USER_PREFIX_PTR=105
+const EXPIRY_BLOCK_PTR=106
+
+const MERCHANT_SUFFIX=8
+const MERCHANT_PREFIX=9
+const DEBIT_AMOUNT=10
+
+const ASSET_KEY_PTR=12
+const ASSET_VALUE_PTR=16
+
+# ── Entry point ──
+
+@note_script
+pub proc main
+    mem_store.MERCHANT_SUFFIX
+    mem_store.MERCHANT_PREFIX
+    mem_store.DEBIT_AMOUNT
+    drop
+
+    push.STORAGE_PTR exec.active_note::get_storage
+    # => [num_items, dest_ptr]
+    drop drop
+    # Skip count check for now — focus on dual-sig verification
+
+    # Block height check
+    exec.tx::get_block_number
+    mem_load.EXPIRY_BLOCK_PTR
+    swap gt
+
+    if.true
+        exec.consume_path
+    else
+        exec.reclaim_path
+    end
+
+    exec.sys::truncate_stack
+end
+
+# ── Consume path ──
+#! Requires agent's Falcon signature on the advice stack.
+#! Creates P2ID to merchant only (NO remainder note).
+
+proc consume_path
+    # ── 1. Compute MESSAGE ──
+    push.0 mem_load.DEBIT_AMOUNT mem_load.MERCHANT_PREFIX mem_load.MERCHANT_SUFFIX
+    exec.active_note::get_serial_number
+    exec.poseidon2::merge
+    # => [MESSAGE]
+
+    # ── 2. Verify AGENT signature ──
+    #
+    # The signature can come from either:
+    #   a) The advice STACK (pre-populated via AdviceInputs::with_stack)
+    #      Used in tests and by the agent-only bench.
+    #   b) The advice MAP at key = merge(AGENT_PK, MESSAGE)
+    #      Used by the facilitator submitter (via TransactionRequest::advice_map).
+    #
+    # Strategy: try the advice map first. If the key exists, push the sig
+    # from map → advice stack. If not, assume it's already on the stack.
+
+    padw push.AGENT_PK_PTR mem_loadw_le
+    # => [AGENT_PK, MESSAGE]
+
+    # Compute map key = merge(AGENT_PK, MESSAGE)
+    dupw.1 dupw.1
+    # => [AGENT_PK, MESSAGE, AGENT_PK, MESSAGE]
+    exec.poseidon2::merge
+    # => [SIG_KEY, AGENT_PK, MESSAGE]
+
+    # Check if the key exists in the advice map
+    adv.has_mapkey
+    # => [SIG_KEY, AGENT_PK, MESSAGE]
+    adv_push.1
+    # => [has_sig, SIG_KEY, AGENT_PK, MESSAGE]
+
+    if.true
+        # Sig is in the map — push it to the advice stack
+        # SIG_KEY is still on the operand stack
+        adv.push_mapval
+        # => [SIG_KEY, AGENT_PK, MESSAGE]
+        # AS => [PREPARED_SIG]
+        dropw
+        # => [AGENT_PK, MESSAGE]
+    else
+        # Sig is already on the advice stack (test/bench mode)
+        dropw
+        # => [AGENT_PK, MESSAGE]
+    end
+
+    exec.falcon512_poseidon2::verify
+    # => []
+
+    # ── 3. Add assets to vault ──
+    exec.wallet::add_assets_to_account
+    push.ASSET_KEY_PTR exec.active_note::get_assets drop drop
+
+    # ── 6. Create P2ID to merchant ──
+    exec.active_note::get_serial_number
+    swap.3 push.1 add swap.3
+    push.1 push.0
+    mem_load.MERCHANT_PREFIX mem_load.MERCHANT_SUFFIX
+    exec.p2id::new
+
+    push.0.0.0 mem_load.DEBIT_AMOUNT
+    padw push.ASSET_KEY_PTR mem_loadw_le
+    call.wallet::move_asset_to_note
+    dropw dropw dropw dropw
+
+    # ── Section 7 REMOVED: no remainder note ──
+end
+
+# ── Reclaim path ──
+#! After expiry, agent_sig required.
+#! Creates P2ID to user for full balance.
+
+proc reclaim_path
+    # Compute reclaim MESSAGE
+    push.0.0
+    mem_load.USER_PREFIX_PTR mem_load.USER_SUFFIX_PTR
+    exec.active_note::get_serial_number
+    exec.poseidon2::merge
+    # => [MESSAGE]
+
+    # Verify agent sig only (no facilitator needed after expiry)
+    padw push.AGENT_PK_PTR mem_loadw_le
+    exec.falcon512_poseidon2::verify
+
+    # Add assets + create P2ID to user
+    exec.wallet::add_assets_to_account
+    push.ASSET_KEY_PTR exec.active_note::get_assets drop drop
+
+    exec.active_note::get_serial_number
+    swap.3 push.1 add swap.3
+    push.1 push.0
+    mem_load.USER_PREFIX_PTR mem_load.USER_SUFFIX_PTR
+    exec.p2id::new
+
+    padw push.ASSET_VALUE_PTR mem_loadw_le
+    padw push.ASSET_KEY_PTR mem_loadw_le
+    call.wallet::move_asset_to_note
+    dropw dropw dropw dropw
+end
