@@ -17,7 +17,7 @@ use miden_client::transaction::TransactionRequestBuilder;
 use miden_client::{Client, Felt};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::{Account, AccountId};
-use miden_protocol::note::{Note, NoteDetails, NoteFile};
+use miden_protocol::note::{Note, NoteDetails, NoteFile, NoteTag};
 use miden_protocol::utils::serde::{Deserializable, Serializable};
 use miden_protocol::{Hasher, Word};
 use miden_client::rpc::{Endpoint, GrpcClient};
@@ -89,14 +89,18 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     client.add_account(&fac_account, false).await?;
     eprintln!("facilitator account imported");
 
-    // Import ADN note with tag
-    let tag = note.metadata().tag();
-    let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
-    client.import_notes(&[NoteFile::NoteDetails {
-        details: note_details,
-        after_block_num: 0u32.into(),
-        tag: Some(tag),
-    }]).await?;
+    // Import ADN note — skip import entirely if NO_IMPORT set (note stays unauthenticated)
+    if std::env::var("NO_IMPORT").is_ok() {
+        eprintln!("NO_IMPORT: skipping import — note will be unauthenticated");
+    } else {
+        let tag = note.metadata().tag();
+        let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
+        client.import_notes(&[NoteFile::NoteDetails {
+            details: note_details,
+            after_block_num: 0u32.into(),
+            tag: Some(tag),
+        }]).await?;
+    }
 
     // Sync — try multiple times to fill MMR gaps
     let sync = client.sync_state().await?;
