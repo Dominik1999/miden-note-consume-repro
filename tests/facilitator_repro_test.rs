@@ -84,19 +84,54 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     client.add_account(&fac_account, false).await?;
     eprintln!("facilitator account imported");
 
-    // Import ADN note (with tag)
-    let tag = note.metadata().tag();
-    let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
-    client.import_notes(&[NoteFile::NoteDetails {
-        details: note_details,
-        after_block_num: 0u32.into(),
-        tag: Some(tag),
-    }]).await?;
-    eprintln!("ADN note imported with tag={tag:?}");
+    // Variant A: import + sync (authenticated path)
+    // Variant B: sync only, no import (unauthenticated path)
+    // Variant C: import only, no sync
+    let variant = std::env::var("VARIANT").unwrap_or_else(|_| "A".into());
+    eprintln!("Running variant {variant}");
 
-    // Sync
-    let sync = client.sync_state().await?;
-    eprintln!("synced to block {}", sync.block_num);
+    match variant.as_str() {
+        "A" => {
+            let tag = note.metadata().tag();
+            let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
+            client.import_notes(&[NoteFile::NoteDetails {
+                details: note_details,
+                after_block_num: 0u32.into(),
+                tag: Some(tag),
+            }]).await?;
+            eprintln!("imported note with tag={tag:?}");
+            let sync = client.sync_state().await?;
+            eprintln!("synced to block {}", sync.block_num);
+        }
+        "B" => {
+            // No import, just sync — note will be unauthenticated
+            let sync = client.sync_state().await?;
+            eprintln!("synced to block {} (no import)", sync.block_num);
+        }
+        "C" => {
+            // Import only, no sync — note will be in Expected state, no block headers
+            let tag = note.metadata().tag();
+            let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
+            client.import_notes(&[NoteFile::NoteDetails {
+                details: note_details,
+                after_block_num: 0u32.into(),
+                tag: Some(tag),
+            }]).await?;
+            eprintln!("imported note (no sync)");
+        }
+        _ => anyhow::bail!("unknown variant"),
+    }
+
+    // Check note state after sync
+    let note_id = note.id();
+    match client.get_input_note(note_id).await {
+        Ok(Some(record)) => {
+            eprintln!("note state after sync: {:?}", record.state());
+            eprintln!("note is_authenticated: {}", record.is_authenticated());
+        }
+        Ok(None) => eprintln!("NOTE NOT FOUND IN STORE after sync!"),
+        Err(e) => eprintln!("get_input_note error: {e}"),
+    }
 
     // Check consumable
     let consumable = client.get_consumable_notes(Some(facilitator_id)).await?;
@@ -123,14 +158,36 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     // But we can test if the note is at least executable WITHOUT the sig
     // (should fail at falcon verify, NOT at StackReadFailed)
 
-    eprintln!("attempting consume WITHOUT signature (should fail at verify, not StackReadFailed)...");
+    // Save the store path for offline debugging
+    eprintln!("store path: {}", data_dir.join("store.sqlite3").display());
+
+    eprintln!("attempting execute_transaction (no prove/submit)...");
 
     let consume_req = TransactionRequestBuilder::new()
         .input_notes([(note, Some(note_args))])
         .build()
         .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
 
-    match client.submit_new_transaction(facilitator_id, consume_req).await {
+    // Try execute_transaction first (local execution only, no proving/submission)
+    match client.execute_transaction(facilitator_id, consume_req.clone()).await {
+        Ok(result) => {
+            eprintln!("execute_transaction SUCCEEDED: {} output notes",
+                result.executed_transaction().output_notes().num_notes());
+        }
+        Err(e) => {
+            let err_str = format!("{e:?}");
+            eprintln!("execute_transaction FAILED: {}", &err_str[..err_str.len().min(300)]);
+        }
+    }
+
+    // Also try submit (which calls execute internally)
+    eprintln!("attempting submit_new_transaction...");
+    let consume_req2 = TransactionRequestBuilder::new()
+        .input_notes([(Note::read_from_bytes(&note_bytes)?, Some(note_args))])
+        .build()
+        .map_err(|e| anyhow::anyhow!("build2: {e:?}"))?;
+
+    match client.submit_new_transaction(facilitator_id, consume_req2).await {
         Ok(tx_id) => {
             eprintln!("UNEXPECTED SUCCESS: {tx_id}");
         }

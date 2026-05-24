@@ -216,8 +216,13 @@ async fn offline_cross_client_adn() -> anyhow::Result<()> {
     eprintln!("[offline] ADN note on-chain: {} ({} bytes serialized)", note_id, note_bytes.len());
 
     // ═══════════════════════════════════════════════════════════════
-    // CLIENT B: separate client, imports note from bytes, consumes
+    // CLIENT B: separate client with its OWN MockChain (note NOT in this chain)
+    // This simulates the facilitator pattern where the consuming client
+    // connects to a chain that has the note but the client only knows about
+    // it from imported bytes.
     // ═══════════════════════════════════════════════════════════════
+    // Use the SAME shared MockChain so client B can discover the note during sync
+    // (the note IS on-chain, just like on testnet)
     let (mut client_b, _rpc_b, keystore_b): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore) = create_mock_client(rpc.clone()).await?;
 
     // Import facilitator account from serialized bytes
@@ -242,7 +247,16 @@ async fn offline_cross_client_adn() -> anyhow::Result<()> {
 
     // Sync client B
     client_b.sync_state().await?;
-    eprintln!("[offline] client B synced, note imported from bytes");
+
+    // Check note state
+    match client_b.get_input_note(note_id).await {
+        Ok(Some(record)) => {
+            eprintln!("[offline] note state: {:?}", record.state());
+            eprintln!("[offline] note is_authenticated: {}", record.is_authenticated());
+        }
+        Ok(None) => eprintln!("[offline] NOTE NOT FOUND"),
+        Err(e) => eprintln!("[offline] get_input_note error: {e}"),
+    }
 
     // Check consumable
     let consumable: Vec<_> = client_b.get_consumable_notes(Some(facilitator_id)).await?;
