@@ -52,10 +52,30 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
         std::fs::read_to_string(setup_dir.join("facilitator_account.b64"))?.trim())?;
     let fac_account = Account::read_from_bytes(&fac_bytes)?;
 
-    let note_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        std::fs::read_to_string(setup_dir.join("adn_note.b64"))?.trim())?;
-    let note = Note::read_from_bytes(&note_bytes)?;
+    // Try .mno (NoteFile::NoteWithProof) first, fall back to .b64 (raw Note)
+    let (note, note_file_for_import) = if setup_dir.join("adn_note.mno").exists() {
+        let mno_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            std::fs::read_to_string(setup_dir.join("adn_note.mno"))?.trim())?;
+        let note_file = NoteFile::read_from_bytes(&mno_bytes)
+            .map_err(|e| anyhow::anyhow!("NoteFile decode: {e}"))?;
+        let note: Note = match &note_file {
+            NoteFile::NoteWithProof(n, _) => n.clone(),
+            NoteFile::NoteDetails { details, .. } => {
+                anyhow::bail!("expected NoteWithProof, got NoteDetails")
+            }
+            NoteFile::NoteId(_) => anyhow::bail!("expected NoteWithProof, got NoteId"),
+        };
+        eprintln!("loaded .mno (NoteFile::NoteWithProof) — includes inclusion proof");
+        (note, Some(note_file))
+    } else {
+        let note_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            std::fs::read_to_string(setup_dir.join("adn_note.b64"))?.trim())?;
+        let note = Note::read_from_bytes(&note_bytes)?;
+        eprintln!("loaded .b64 (raw Note) — NO inclusion proof (legacy)");
+        (note, None)
+    };
     let note_id = note.id();
     eprintln!("note id={note_id}, storage={}, assets={}",
         note.recipient().storage().num_items(), note.assets().num_assets());
@@ -89,10 +109,12 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     client.add_account(&fac_account, false).await?;
     eprintln!("facilitator account imported");
 
-    // Import ADN note — skip import entirely if NO_IMPORT set (note stays unauthenticated)
-    if std::env::var("NO_IMPORT").is_ok() {
-        eprintln!("NO_IMPORT: skipping import — note will be unauthenticated");
+    // Import ADN note — use NoteFile::NoteWithProof if available (.mno), otherwise NoteDetails
+    if let Some(nf) = note_file_for_import {
+        eprintln!("importing via NoteFile::NoteWithProof (includes inclusion proof)");
+        client.import_notes(&[nf]).await?;
     } else {
+        eprintln!("importing via NoteFile::NoteDetails (no inclusion proof — legacy)");
         let tag = note.metadata().tag();
         let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
         client.import_notes(&[NoteFile::NoteDetails {
