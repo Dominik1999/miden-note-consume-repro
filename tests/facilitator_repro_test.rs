@@ -4,17 +4,20 @@
 //! the facilitator binary uses, creates a fresh miden-client, imports
 //! the account + note, syncs, and tries to consume.
 //!
-//! Run: SETUP_DIR=/tmp/chain-finality-test2 cargo test --test facilitator_repro_test -- --ignored --nocapture
+//! Run: SETUP_DIR=/tmp/chain-finality-test3 cargo test --test facilitator_repro_test -- --ignored --nocapture
 
 use std::sync::Arc;
+use std::time::Duration;
 
+use miden_client::asset::FungibleAsset;
 use miden_client::builder::ClientBuilder;
-use miden_client::keystore::FilesystemKeyStore;
+use miden_client::keystore::{FilesystemKeyStore, Keystore};
+use miden_client::note::NoteType;
 use miden_client::transaction::TransactionRequestBuilder;
 use miden_client::{Client, Felt};
 use miden_client_sqlite_store::ClientBuilderSqliteExt;
 use miden_protocol::account::{Account, AccountId};
-use miden_protocol::note::{Note, NoteDetails, NoteFile, NoteTag};
+use miden_protocol::note::{Note, NoteDetails, NoteFile};
 use miden_protocol::utils::serde::{Deserializable, Serializable};
 use miden_protocol::{Hasher, Word};
 use miden_client::rpc::{Endpoint, GrpcClient};
@@ -32,31 +35,29 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     )?;
     let facilitator_id_hex = setup_toml["facilitator_account_id_hex"].as_str().unwrap();
     let facilitator_id = AccountId::from_hex(facilitator_id_hex)?;
-    eprintln!("facilitator: {facilitator_id_hex}");
-
     let merchant_id_hex = setup_toml["merchant_id_hex"].as_str().unwrap();
     let merchant_id = AccountId::from_hex(merchant_id_hex)?;
+    let faucet_id_hex = setup_toml["faucet_id_hex"].as_str().unwrap();
+    let faucet_id = AccountId::from_hex(faucet_id_hex)?;
+    eprintln!("facilitator={facilitator_id_hex} merchant={merchant_id_hex} faucet={faucet_id_hex}");
 
-    // Read facilitator account from snapshot
-    let fac_b64 = std::fs::read_to_string(setup_dir.join("facilitator_account.b64"))?;
+    // Read facilitator account + ADN note from snapshots
     let fac_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, fac_b64.trim())?;
+        &base64::engine::general_purpose::STANDARD,
+        std::fs::read_to_string(setup_dir.join("facilitator_account.b64"))?.trim())?;
     let fac_account = Account::read_from_bytes(&fac_bytes)?;
-    eprintln!("facilitator account: {} bytes, id={}", fac_bytes.len(), fac_account.id().to_hex());
 
-    // Read ADN note from snapshot
-    let note_b64 = std::fs::read_to_string(setup_dir.join("adn_note.b64"))?;
     let note_bytes = base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD, note_b64.trim())?;
+        &base64::engine::general_purpose::STANDARD,
+        std::fs::read_to_string(setup_dir.join("adn_note.b64"))?.trim())?;
     let note = Note::read_from_bytes(&note_bytes)?;
-    eprintln!("ADN note: {} bytes, id={}, storage={}, assets={}",
-        note_bytes.len(), note.id(), note.recipient().storage().num_items(), note.assets().num_assets());
+    let note_id = note.id();
+    eprintln!("note id={note_id}, storage={}, assets={}",
+        note.recipient().storage().num_items(), note.assets().num_assets());
 
-    // Create a fresh client
+    // Create client with keystore from setup
     let tmp = tempfile::tempdir()?;
     let data_dir = tmp.path();
-
-    // Copy keystore from setup
     let keystore_dir = data_dir.join("keystore");
     std::fs::create_dir_all(&keystore_dir)?;
     for entry in std::fs::read_dir(setup_dir.join("keystore"))? {
@@ -69,12 +70,11 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     let rpc = Arc::new(GrpcClient::new(&endpoint, 30_000));
     let keystore = Arc::new(FilesystemKeyStore::new(keystore_dir)
         .map_err(|e| anyhow::anyhow!("keystore: {e:?}"))?);
-    let store_path = data_dir.join("store.sqlite3");
 
     let mut client = ClientBuilder::new()
         .rpc(rpc)
-        .sqlite_store(store_path)
-        .authenticator(keystore)
+        .sqlite_store(data_dir.join("store.sqlite3"))
+        .authenticator(keystore.clone())
         .in_debug_mode(true.into())
         .build()
         .await
@@ -84,120 +84,84 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     client.add_account(&fac_account, false).await?;
     eprintln!("facilitator account imported");
 
-    // Variant A: import + sync (authenticated path)
-    // Variant B: sync only, no import (unauthenticated path)
-    // Variant C: import only, no sync
-    let variant = std::env::var("VARIANT").unwrap_or_else(|_| "A".into());
-    eprintln!("Running variant {variant}");
+    // Import ADN note with tag
+    let tag = note.metadata().tag();
+    let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
+    client.import_notes(&[NoteFile::NoteDetails {
+        details: note_details,
+        after_block_num: 0u32.into(),
+        tag: Some(tag),
+    }]).await?;
 
-    match variant.as_str() {
-        "A" => {
-            let tag = note.metadata().tag();
-            let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
-            client.import_notes(&[NoteFile::NoteDetails {
-                details: note_details,
-                after_block_num: 0u32.into(),
-                tag: Some(tag),
-            }]).await?;
-            eprintln!("imported note with tag={tag:?}");
-            let sync = client.sync_state().await?;
-            eprintln!("synced to block {}", sync.block_num);
-        }
-        "B" => {
-            // No import, just sync — note will be unauthenticated
-            let sync = client.sync_state().await?;
-            eprintln!("synced to block {} (no import)", sync.block_num);
-        }
-        "C" => {
-            // Import only, no sync — note will be in Expected state, no block headers
-            let tag = note.metadata().tag();
-            let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
-            client.import_notes(&[NoteFile::NoteDetails {
-                details: note_details,
-                after_block_num: 0u32.into(),
-                tag: Some(tag),
-            }]).await?;
-            eprintln!("imported note (no sync)");
-        }
-        _ => anyhow::bail!("unknown variant"),
-    }
+    // Initial sync
+    let sync = client.sync_state().await?;
+    eprintln!("synced to block {}", sync.block_num);
 
-    // Check note state after sync
-    let note_id = note.id();
+    // Check note state
     match client.get_input_note(note_id).await {
-        Ok(Some(record)) => {
-            eprintln!("note state after sync: {:?}", record.state());
-            eprintln!("note is_authenticated: {}", record.is_authenticated());
-        }
-        Ok(None) => eprintln!("NOTE NOT FOUND IN STORE after sync!"),
+        Ok(Some(record)) => eprintln!("note is_authenticated={}", record.is_authenticated()),
+        Ok(None) => eprintln!("note NOT FOUND"),
         Err(e) => eprintln!("get_input_note error: {e}"),
     }
 
-    // Check consumable
-    let consumable = client.get_consumable_notes(Some(facilitator_id)).await?;
-    eprintln!("consumable notes for facilitator: {}", consumable.len());
-    for (n, relevance) in &consumable {
-        eprintln!("  note {} relevance={relevance:?}", n.id());
+    // ── Deploy facilitator by funding it (mint + consume) ──
+    let should_fund = std::env::var("FUND_FACILITATOR").is_ok();
+    if should_fund {
+        eprintln!("FUND_FACILITATOR set: minting to facilitator to deploy it on-chain...");
+
+        // We need the faucet account too — import it from setup
+        let faucet_bytes = base64::Engine::decode(
+            &base64::engine::general_purpose::STANDARD,
+            // The faucet was created by setup-testnet's client, not exported as b64.
+            // We can't mint from here without the faucet account.
+            // Instead, use a noop tx to deploy the facilitator.
+            "".as_bytes()
+        );
+
+        // Alternative: just do a noop transaction to deploy the facilitator on-chain
+        eprintln!("submitting noop tx to deploy facilitator on-chain...");
+        let noop_req = TransactionRequestBuilder::new()
+            .build()
+            .map_err(|e| anyhow::anyhow!("noop build: {e:?}"))?;
+        match client.submit_new_transaction(facilitator_id, noop_req).await {
+            Ok(tx_id) => eprintln!("noop tx succeeded: {tx_id}"),
+            Err(e) => eprintln!("noop tx failed (expected if account not funded): {e}"),
+        }
+
+        // Wait 3 blocks
+        eprintln!("waiting for 3 blocks...");
+        for _ in 0..10 {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            client.sync_state().await?;
+        }
+        eprintln!("waited, now re-synced");
+    } else {
+        eprintln!("FUND_FACILITATOR not set — skipping on-chain deployment");
     }
 
-    // Build note_args: [merchant_suffix, merchant_prefix, amount=100, 0]
+    // ── Try to consume the ADN note ──
     let amount = 100u64;
     let note_args: Word = [
         merchant_id.suffix(), merchant_id.prefix().as_felt(),
         Felt::new(amount), Felt::ZERO,
     ].into();
 
-    let serial_num = note.recipient().serial_num();
-    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
-
-    // Get agent PK from note storage
-    let storage = note.recipient().storage().to_elements();
-    let agent_pk: Word = [storage[0], storage[1], storage[2], storage[3]].into();
-
-    // We don't have the agent's secret key here, so we can't sign.
-    // But we can test if the note is at least executable WITHOUT the sig
-    // (should fail at falcon verify, NOT at StackReadFailed)
-
-    // Save the store path for offline debugging
-    eprintln!("store path: {}", data_dir.join("store.sqlite3").display());
-
-    eprintln!("attempting execute_transaction (no prove/submit)...");
+    eprintln!("attempting consume...");
 
     let consume_req = TransactionRequestBuilder::new()
         .input_notes([(note, Some(note_args))])
         .build()
         .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
 
-    // Try execute_transaction first (local execution only, no proving/submission)
-    match client.execute_transaction(facilitator_id, consume_req.clone()).await {
+    match client.execute_transaction(facilitator_id, consume_req).await {
         Ok(result) => {
-            eprintln!("execute_transaction SUCCEEDED: {} output notes",
-                result.executed_transaction().output_notes().num_notes());
-        }
-        Err(e) => {
-            let err_str = format!("{e:?}");
-            eprintln!("execute_transaction FAILED: {}", &err_str[..err_str.len().min(300)]);
-        }
-    }
-
-    // Also try submit (which calls execute internally)
-    eprintln!("attempting submit_new_transaction...");
-    let consume_req2 = TransactionRequestBuilder::new()
-        .input_notes([(Note::read_from_bytes(&note_bytes)?, Some(note_args))])
-        .build()
-        .map_err(|e| anyhow::anyhow!("build2: {e:?}"))?;
-
-    match client.submit_new_transaction(facilitator_id, consume_req2).await {
-        Ok(tx_id) => {
-            eprintln!("UNEXPECTED SUCCESS: {tx_id}");
+            eprintln!("SUCCESS: {} output notes", result.executed_transaction().output_notes().num_notes());
         }
         Err(e) => {
             let err_str = format!("{e:?}");
             eprintln!("FAILED: {}", &err_str[..err_str.len().min(300)]);
             if err_str.contains("StackReadFailed") {
-                eprintln!("BUG REPRODUCED: StackReadFailed from facilitator pattern");
-            } else {
-                eprintln!("Different error (expected — no signature provided)");
+                eprintln!("BUG: StackReadFailed");
             }
         }
     }
