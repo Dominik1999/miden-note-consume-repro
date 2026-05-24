@@ -237,12 +237,27 @@ async fn offline_cross_client_adn() -> anyhow::Result<()> {
     // ═══════════════════════════════════════════════════════════════
     // CLIENT B: separate client, same MockChain
     // ═══════════════════════════════════════════════════════════════
-    let (mut client_b, _rpc_b, keystore_b, _store_b): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore, std::path::PathBuf) = create_mock_client(rpc.clone()).await?;
+    let (mut client_b, _rpc_b, keystore_b, store_b): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore, std::path::PathBuf) = create_mock_client(rpc.clone()).await?;
 
     // Import facilitator account from serialized bytes
     let fac_account = Account::read_from_bytes(&facilitator_bytes)?;
     client_b.add_account(&fac_account, false).await?;
     Keystore::add_key(&keystore_b, &facilitator_key, facilitator_id).await.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+
+    // If DROP_SEED is set, clear the account seed from the store to simulate
+    // the testnet pattern where the account was never deployed locally
+    if std::env::var("DROP_SEED").is_ok() {
+        eprintln!("[offline] DROP_SEED: clearing account seed from store");
+        let output = std::process::Command::new("sqlite3")
+            .arg(&store_b)
+            .arg("UPDATE latest_account_headers SET account_seed = NULL;")
+            .output();
+        match output {
+            Ok(o) if o.status.success() => eprintln!("[offline] seed cleared"),
+            Ok(o) => eprintln!("[offline] sqlite3 failed: {}", String::from_utf8_lossy(&o.stderr)),
+            Err(e) => eprintln!("[offline] sqlite3 not available: {e}"),
+        }
+    }
 
     // Deserialize the note from bytes (like the facilitator does)
     let deserialized_note = Note::read_from_bytes(&note_bytes)?;
