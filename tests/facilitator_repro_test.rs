@@ -144,6 +144,16 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
         eprintln!("FUND_FACILITATOR not set — skipping on-chain deployment");
     }
 
+    // HYPOTHESIS: Compiling the MASM in-process loads the p2id/wallet library MASTs
+    // into the global store. Without this, the executor can't find library procedures.
+    if std::env::var("PRECOMPILE_MASM").is_ok() {
+        eprintln!("PRECOMPILE_MASM: compiling ADN MASM to load library MASTs into process...");
+        let _script = miden_standards::code_builder::CodeBuilder::default()
+            .compile_note_script(include_str!("../masm/agent_debit_note.masm"))
+            .expect("compile");
+        eprintln!("PRECOMPILE_MASM: done");
+    }
+
     // ── Try to consume the ADN note (with Falcon signature, matching offline test) ──
     let amount = 100u64;
     let note_args: Word = [
