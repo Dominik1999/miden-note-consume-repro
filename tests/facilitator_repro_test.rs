@@ -144,17 +144,35 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
         eprintln!("FUND_FACILITATOR not set — skipping on-chain deployment");
     }
 
-    // ── Try to consume the ADN note ──
+    // ── Try to consume the ADN note (with Falcon signature, matching offline test) ──
     let amount = 100u64;
     let note_args: Word = [
         merchant_id.suffix(), merchant_id.prefix().as_felt(),
         Felt::new(amount), Felt::ZERO,
     ].into();
 
-    eprintln!("attempting consume...");
+    // Read agent's secret key to produce the Falcon signature
+    let agent_key_path = setup_dir.join(
+        setup_toml["agents"].as_array().unwrap()[0].get("hot_key_path").unwrap().as_str().unwrap()
+    );
+    let agent_sk_bytes = std::fs::read(&agent_key_path)?;
+    let falcon_sk = miden_protocol::crypto::dsa::falcon512_poseidon2::SecretKey::read_from_bytes(&agent_sk_bytes)
+        .map_err(|e| anyhow::anyhow!("agent key: {e}"))?;
+    let agent_sk = miden_protocol::account::auth::AuthSecretKey::Falcon512Poseidon2(falcon_sk);
+    let agent_pk: Word = agent_sk.public_key().to_commitment().into();
+
+    let serial_num = note.recipient().serial_num();
+    let message: Word = Hasher::merge(&[serial_num.into(), note_args.into()]).into();
+    let sig = agent_sk.sign(message);
+    let prepared: Vec<Felt> = sig.to_prepared_signature(message);
+    let sig_key: Word = Hasher::merge(&[agent_pk.into(), message.into()]).into();
+
+    eprintln!("attempting consume (with Falcon sig in advice map)...");
+    eprintln!("  sig_key={sig_key:?} prepared_len={}", prepared.len());
 
     let consume_req = TransactionRequestBuilder::new()
         .input_notes([(note, Some(note_args))])
+        .extend_advice_map([(sig_key, prepared.as_slice())])
         .build()
         .map_err(|e| anyhow::anyhow!("build: {e:?}"))?;
 
