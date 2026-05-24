@@ -48,12 +48,14 @@ fn temp_keystore() -> (FilesystemKeyStore, std::path::PathBuf) {
 /// Create a Client backed by the given MockRpcApi (offline, no testnet).
 async fn create_mock_client(
     rpc: MockRpcApi,
-) -> anyhow::Result<(miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore)> {
+) -> anyhow::Result<(miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore, std::path::PathBuf)> {
     let (keystore, _dir) = temp_keystore();
     let rpc_clone = rpc.clone();
+    let store_path = temp_store_path();
+    let store_path_clone = store_path.clone();
     let mut client = ClientBuilder::new()
         .rpc(Arc::new(rpc))
-        .sqlite_store(temp_store_path())
+        .sqlite_store(store_path)
         .authenticator(Arc::new(keystore.clone()))
         .in_debug_mode(true.into())
         .build()
@@ -63,7 +65,7 @@ async fn create_mock_client(
     // Ensure genesis block is in the store
     client.ensure_genesis_in_place().await?;
 
-    Ok((client, rpc_clone, keystore))
+    Ok((client, rpc_clone, keystore, store_path_clone))
 }
 
 /// Offline cross-client test:
@@ -71,6 +73,11 @@ async fn create_mock_client(
 /// Both clients use the SAME MockRpcApi (shared MockChain) but separate stores.
 #[tokio::test]
 async fn offline_cross_client_adn() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .try_init();
+
     // Build a shared MockChain
     let mock_chain = MockChain::new();
     let rpc = MockRpcApi::new(mock_chain);
@@ -78,7 +85,7 @@ async fn offline_cross_client_adn() -> anyhow::Result<()> {
     // ═══════════════════════════════════════════════════════════════
     // CLIENT A: creates accounts + note
     // ═══════════════════════════════════════════════════════════════
-    let (mut client_a, rpc_a, keystore_a): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore) = create_mock_client(rpc.clone()).await?;
+    let (mut client_a, rpc_a, keystore_a, _store_a): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore, std::path::PathBuf) = create_mock_client(rpc.clone()).await?;
     eprintln!("[offline] client A created");
 
     // Deploy faucet
@@ -230,7 +237,7 @@ async fn offline_cross_client_adn() -> anyhow::Result<()> {
     // ═══════════════════════════════════════════════════════════════
     // CLIENT B: separate client, same MockChain
     // ═══════════════════════════════════════════════════════════════
-    let (mut client_b, _rpc_b, keystore_b): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore) = create_mock_client(rpc.clone()).await?;
+    let (mut client_b, _rpc_b, keystore_b, _store_b): (miden_client::Client<FilesystemKeyStore>, MockRpcApi, FilesystemKeyStore, std::path::PathBuf) = create_mock_client(rpc.clone()).await?;
 
     // Import facilitator account from serialized bytes
     let fac_account = Account::read_from_bytes(&facilitator_bytes)?;

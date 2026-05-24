@@ -25,6 +25,11 @@ use miden_client::rpc::{Endpoint, GrpcClient};
 #[tokio::test]
 #[ignore = "requires SETUP_DIR env var pointing to setup-testnet output"]
 async fn facilitator_consume_from_files() -> anyhow::Result<()> {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")))
+        .try_init();
+
     let setup_dir = std::env::var("SETUP_DIR")
         .map_err(|_| anyhow::anyhow!("set SETUP_DIR to the setup-testnet output dir"))?;
     let setup_dir = std::path::PathBuf::from(setup_dir);
