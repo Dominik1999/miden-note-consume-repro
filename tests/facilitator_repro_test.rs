@@ -109,12 +109,15 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
     client.add_account(&fac_account, false).await?;
     eprintln!("facilitator account imported");
 
-    // Import ADN note — use NoteFile::NoteWithProof if available (.mno), otherwise NoteDetails
+    // Match proc_adn_consume EXACTLY: add_account → sync → import → sync loop
+    client.sync_state().await?;
+    eprintln!("initial sync done");
+
+    // Import the NoteFile
     if let Some(nf) = note_file_for_import {
-        eprintln!("importing via NoteFile::NoteWithProof (includes inclusion proof)");
         client.import_notes(&[nf]).await?;
+        eprintln!("NoteFile imported");
     } else {
-        eprintln!("importing via NoteFile::NoteDetails (no inclusion proof — legacy)");
         let tag = note.metadata().tag();
         let note_details = NoteDetails::new(note.assets().clone(), note.recipient().clone());
         client.import_notes(&[NoteFile::NoteDetails {
@@ -122,6 +125,22 @@ async fn facilitator_consume_from_files() -> anyhow::Result<()> {
             after_block_num: 0u32.into(),
             tag: Some(tag),
         }]).await?;
+        eprintln!("NoteDetails imported");
+    }
+
+    // Sync loop (matching proc_adn_consume — up to 30 attempts)
+    for attempt in 0..30 {
+        client.sync_state().await?;
+        if let Ok(Some(record)) = client.get_input_note(note.id()).await {
+            if record.is_authenticated() {
+                eprintln!("note authenticated (attempt {attempt})");
+                break;
+            }
+        }
+        if attempt == 29 {
+            eprintln!("WARNING: not authenticated after 30 attempts");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     }
 
     // Sync — try multiple times to fill MMR gaps

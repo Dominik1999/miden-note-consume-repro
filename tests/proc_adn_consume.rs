@@ -109,11 +109,17 @@ async fn proc_adn_consume() -> anyhow::Result<()> {
         wallet_b_account.id().to_hex()
     );
 
-    // ── Read agent secret key ──
+    // ── Read agent secret key (supports both AuthSecretKey and raw Falcon SecretKey formats) ──
     let agent_sk_bytes = std::fs::read(input_dir.join("agent_sk.bin"))?;
-    let agent_sk =
-        miden_client::auth::AuthSecretKey::read_from_bytes(&agent_sk_bytes)
-            .map_err(|e| anyhow::anyhow!("agent_sk decode: {e}"))?;
+    let agent_sk = match miden_client::auth::AuthSecretKey::read_from_bytes(&agent_sk_bytes) {
+        Ok(sk) => sk,
+        Err(_) => {
+            // Fallback: try as raw Falcon SecretKey
+            let falcon_sk = miden_protocol::crypto::dsa::falcon512_poseidon2::SecretKey::read_from_bytes(&agent_sk_bytes)
+                .map_err(|e| anyhow::anyhow!("agent_sk decode (neither AuthSecretKey nor Falcon): {e}"))?;
+            miden_client::auth::AuthSecretKey::Falcon512Poseidon2(falcon_sk)
+        }
+    };
     let agent_pk: Word = agent_sk.public_key().to_commitment().into();
     eprintln!("[consume] agent_pk: {:?}", agent_pk);
 
